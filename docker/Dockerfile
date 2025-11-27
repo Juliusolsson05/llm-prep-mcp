@@ -1,62 +1,89 @@
-# Multi-stage build for smaller final image
-FROM python:3.11-slim as builder
+# =============================================================================
+# LLM Context Prep MCP Server - Production Dockerfile
+# =============================================================================
+# Multi-stage build for minimal image size
+# Usage: docker build -f docker/Dockerfile -t llm-prep-mcp .
+# =============================================================================
 
-# Set working directory
-WORKDIR /build
+# -----------------------------------------------------------------------------
+# Stage 1: Builder
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install Python dependencies
+WORKDIR /build
 COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Final stage
-FROM python:3.11-slim
+# -----------------------------------------------------------------------------
+# Stage 2: Production Runtime
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim AS runtime
 
-# Install runtime dependencies (tree command for better project visualization)
+# Labels for container registries
+LABEL org.opencontainers.image.title="LLM Context Prep MCP Server"
+LABEL org.opencontainers.image.description="MCP server for preparing comprehensive codebase context documents for LLMs"
+LABEL org.opencontainers.image.source="https://github.com/Juliusolsson05/llm-prep-mcp"
+LABEL org.opencontainers.image.url="https://github.com/Juliusolsson05/llm-prep-mcp"
+LABEL org.opencontainers.image.documentation="https://github.com/Juliusolsson05/llm-prep-mcp#readme"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.vendor="Julius Olsson"
+
+# Install runtime dependencies (tree, git for repo analysis)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tree \
     git \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-# Create non-root user
-RUN useradd -m -s /bin/bash mcp && \
+# Create non-root user for security
+RUN groupadd --gid 1000 mcp && \
+    useradd --uid 1000 --gid mcp --shell /bin/bash --create-home mcp && \
     mkdir -p /workspace /app && \
     chown -R mcp:mcp /workspace /app
 
-# Copy Python packages from builder
-COPY --from=builder /root/.local /home/mcp/.local
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Set working directory
+# Setup application
 WORKDIR /app
 
 # Copy application files
 COPY --chown=mcp:mcp src/ ./src/
 COPY --chown=mcp:mcp prompts/ ./prompts/
-COPY --chown=mcp:mcp scripts/ ./scripts/
+COPY --chown=mcp:mcp requirements.txt ./
 
 # Switch to non-root user
 USER mcp
 
-# Add local bin to PATH
-ENV PATH=/home/mcp/.local/bin:$PATH
-ENV PYTHONPATH=/app:$PYTHONPATH
+# Environment variables
 ENV PYTHONUNBUFFERED=1
-
-# MCP server configuration
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app:$PYTHONPATH
+ENV MCP_TRANSPORT=stdio
 ENV MCP_DOCKER_MODE=true
 ENV MCP_WORKSPACE_DIR=/workspace
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)" || exit 1
+# Expose port for HTTP/SSE transport (optional)
+EXPOSE 8847
 
 # Volume for workspace
 VOLUME ["/workspace"]
 
-# Default command - run as stdio MCP server (best for Claude Code)
-CMD ["python", "src/mcp_server_fastmcp.py", "--transport", "stdio"]
+# Health check for orchestration platforms
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import sys; sys.exit(0)"
 
+# Default: STDIO transport for Claude Code
+CMD ["python", "src/mcp_server_fastmcp.py", "--transport", "stdio"]

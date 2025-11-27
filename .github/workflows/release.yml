@@ -1,0 +1,73 @@
+# =============================================================================
+# Release Workflow
+# =============================================================================
+# Automatically creates GitHub releases with install scripts when tags are pushed
+# =============================================================================
+
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Make install scripts executable
+        run: chmod +x scripts/install.sh
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          generate_release_notes: true
+          files: |
+            scripts/install.sh
+            scripts/install.ps1
+          body: |
+            ## 🚀 Quick Install
+
+            ### One-Line Install (Recommended)
+
+            **macOS/Linux:**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/Juliusolsson05/llm-prep-mcp/main/scripts/install.sh | bash
+            ```
+
+            **Windows PowerShell:**
+            ```powershell
+            irm https://raw.githubusercontent.com/Juliusolsson05/llm-prep-mcp/main/scripts/install.ps1 | iex
+            ```
+
+            ### Docker (Manual)
+
+            ```bash
+            # Pull the image
+            docker pull juliusolsson/llm-prep:${{ github.ref_name }}
+
+            # Add to Claude Code
+            claude mcp add llm-prep -s user -- docker run -i --rm -v '$(pwd):/workspace' juliusolsson/llm-prep:${{ github.ref_name }}
+
+            # Verify
+            claude mcp list
+            ```
+
+            ### GitHub Container Registry
+
+            ```bash
+            claude mcp add llm-prep -s user -- docker run -i --rm -v '$(pwd):/workspace' ghcr.io/juliusolsson05/llm-prep-mcp:${{ github.ref_name }}
+            ```
+
+            ---
+
+            📚 **Documentation**: https://github.com/Juliusolsson05/llm-prep-mcp
+
+            🐛 **Issues**: https://github.com/Juliusolsson05/llm-prep-mcp/issues

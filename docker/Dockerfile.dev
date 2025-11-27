@@ -1,0 +1,45 @@
+# =============================================================================
+# LLM Context Prep MCP Server - Development Dockerfile
+# =============================================================================
+# For local development with hot-reload capability
+# Usage: docker build -f docker/Dockerfile.dev -t llm-prep-mcp:dev .
+# =============================================================================
+
+FROM python:3.11-slim
+
+# Install development tools and runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tree \
+    git \
+    curl \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install dependencies first (for better caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Development extras
+RUN pip install --no-cache-dir \
+    pytest \
+    pytest-asyncio \
+    black \
+    ruff \
+    ipython
+
+# Mount source code as volume for hot-reload
+VOLUME ["/app/src"]
+VOLUME ["/workspace"]
+
+# Environment
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV MCP_DEBUG=true
+
+# Expose port for HTTP/SSE transport testing
+EXPOSE 8847
+
+# Default command
+CMD ["python", "src/mcp_server_fastmcp.py", "--transport", "stdio"]
