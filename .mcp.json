@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "llm-prep": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "docker run -i --rm -v \"$(pwd):/workspace\" juliusolsson/llm-prep:latest"
+      ]
+    }
+  }
+}
