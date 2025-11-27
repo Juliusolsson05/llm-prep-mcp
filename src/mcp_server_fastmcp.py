@@ -19,7 +19,9 @@ from llm_prep import LLMContextPrep
 from config import (
     ProjectConfig, load_project_config, save_project_config,
     split_patterns, join_patterns, validate_ignore_patterns, normalize_patterns,
-    suggest_patterns_for_project, analyze_project, server_config
+    suggest_patterns_for_project, analyze_project, server_config,
+    validate_and_resolve_project_path, PathValidationError,
+    safe_iterdir, safe_glob, safe_rglob
 )
 from typing import Literal
 
@@ -204,39 +206,53 @@ def _gather_files_for_chunking(project_path: Path, target_root: Path, patterns: 
     """
     Collect candidate files under target_root, honoring ignore patterns and server_config
     extension/size limits. Sorted by path for determinism.
+
+    Handles permission errors gracefully - skips inaccessible files/directories.
     """
     files: List[Path] = []
     # if 'target_root' is actually a glob pattern, expand it from the project root
     if ("*" in target_root.as_posix()) or ("?" in target_root.as_posix()) or ("[" in target_root.as_posix()):
-        for p in project_path.glob(target_root.as_posix()):
-            if p.is_file():
-                if not server_config.is_file_allowed(p) or not server_config.is_file_size_allowed(p):
-                    continue
-                if _pattern_match(p, project_path, patterns):
-                    continue
-                files.append(p.resolve())
-            elif p.is_dir():
-                for q in p.rglob("*"):
-                    if q.is_file():
-                        if not server_config.is_file_allowed(q) or not server_config.is_file_size_allowed(q):
-                            continue
-                        if _pattern_match(q, project_path, patterns) or _pattern_match(q, p, patterns):
-                            continue
-                        files.append(q.resolve())
-    else:
-        root = target_root
-        if root.is_file():
-            if server_config.is_file_allowed(root) and server_config.is_file_size_allowed(root):
-                if not _pattern_match(root, project_path, patterns) and not _pattern_match(root, root.parent, patterns):
-                    files.append(root.resolve())
-        elif root.is_dir():
-            for p in root.rglob("*"):
+        for p in safe_glob(project_path, target_root.as_posix()):
+            try:
                 if p.is_file():
                     if not server_config.is_file_allowed(p) or not server_config.is_file_size_allowed(p):
                         continue
-                    if _pattern_match(p, project_path, patterns) or _pattern_match(p, root, patterns):
+                    if _pattern_match(p, project_path, patterns):
                         continue
                     files.append(p.resolve())
+                elif p.is_dir():
+                    for q in safe_rglob(p, "*"):
+                        try:
+                            if q.is_file():
+                                if not server_config.is_file_allowed(q) or not server_config.is_file_size_allowed(q):
+                                    continue
+                                if _pattern_match(q, project_path, patterns) or _pattern_match(q, p, patterns):
+                                    continue
+                                files.append(q.resolve())
+                        except PermissionError:
+                            continue
+            except PermissionError:
+                continue
+    else:
+        root = target_root
+        try:
+            if root.is_file():
+                if server_config.is_file_allowed(root) and server_config.is_file_size_allowed(root):
+                    if not _pattern_match(root, project_path, patterns) and not _pattern_match(root, root.parent, patterns):
+                        files.append(root.resolve())
+            elif root.is_dir():
+                for p in safe_rglob(root, "*"):
+                    try:
+                        if p.is_file():
+                            if not server_config.is_file_allowed(p) or not server_config.is_file_size_allowed(p):
+                                continue
+                            if _pattern_match(p, project_path, patterns) or _pattern_match(p, root, patterns):
+                                continue
+                            files.append(p.resolve())
+                    except PermissionError:
+                        continue
+        except PermissionError:
+            pass
     files = sorted(list(dict.fromkeys(files)))
     return files
 
@@ -253,7 +269,11 @@ def _count_lines(path: Path) -> int:
 async def prepare_context(input: PrepareContextInput) -> str:
     """Prepare comprehensive LLM context document from files and notes"""
     try:
-        project_path = Path(input.project_path).resolve()
+        # Validate and resolve project path (handles Docker mode and permissions)
+        try:
+            project_path = validate_and_resolve_project_path(input.project_path)
+        except PathValidationError as e:
+            return f"❌ {str(e)}"
         
         # Load project config
         config = load_project_config(project_path)
@@ -376,7 +396,11 @@ async def prepare_context(input: PrepareContextInput) -> str:
 async def create_debug_notes(input: CreateDebugNotesInput) -> str:
     """Create markdown notes file for later use as context dump"""
     try:
-        project_path = Path(input.project_path).resolve()
+        # Validate and resolve project path
+        try:
+            project_path = validate_and_resolve_project_path(input.project_path)
+        except PathValidationError as e:
+            return f"❌ {str(e)}"
         notes_dir = project_path / input.subfolder
         notes_dir.mkdir(parents=True, exist_ok=True)
         
@@ -409,7 +433,11 @@ type: debug_notes
 async def set_project_config(input: SetProjectConfigInput) -> str:
     """Configure project-specific settings for context preparation"""
     try:
-        project_path = Path(input.project_path).resolve()
+        # Validate and resolve project path
+        try:
+            project_path = validate_and_resolve_project_path(input.project_path)
+        except PathValidationError as e:
+            return f"❌ {str(e)}"
         config = load_project_config(project_path)
         
         if input.tree_ignore is not None:
@@ -433,7 +461,11 @@ async def set_project_config(input: SetProjectConfigInput) -> str:
 async def list_recent_contexts(input: ListRecentContextsInput) -> str:
     """List recently generated context documents for a project"""
     try:
-        project_path = Path(input.project_path).resolve()
+        # Validate and resolve project path
+        try:
+            project_path = validate_and_resolve_project_path(input.project_path)
+        except PathValidationError as e:
+            return f"❌ {str(e)}"
         config = load_project_config(project_path)
         
         if not config.recent_contexts:
@@ -455,7 +487,11 @@ async def list_recent_contexts(input: ListRecentContextsInput) -> str:
 async def clean_temp_notes(input: CleanTempNotesInput) -> str:
     """Clean up temporary note files in .llm_prep_notes"""
     try:
-        project_path = Path(input.project_path).resolve()
+        # Validate and resolve project path
+        try:
+            project_path = validate_and_resolve_project_path(input.project_path)
+        except PathValidationError as e:
+            return f"❌ {str(e)}"
         notes_dir = project_path / ".llm_prep_notes"
         
         if not notes_dir.exists():
@@ -479,7 +515,11 @@ async def clean_temp_notes(input: CleanTempNotesInput) -> str:
 async def get_tree_ignore(input: GetTreeIgnoreInput) -> str:
     """Get current tree ignore patterns and suggestions."""
     try:
-        project_path = Path(input.project_path).resolve()
+        # Validate and resolve project path
+        try:
+            project_path = validate_and_resolve_project_path(input.project_path)
+        except PathValidationError as e:
+            return f"❌ {str(e)}"
         config = load_project_config(project_path)
         current = split_patterns(config.tree_ignore)
         info = analyze_project(project_path)
@@ -505,7 +545,11 @@ async def get_tree_ignore(input: GetTreeIgnoreInput) -> str:
 async def update_tree_ignore(input: UpdateTreeIgnoreInput) -> str:
     """Update tree ignore patterns with intelligent suggestions & history."""
     try:
-        project_path = Path(input.project_path).resolve()
+        # Validate and resolve project path
+        try:
+            project_path = validate_and_resolve_project_path(input.project_path)
+        except PathValidationError as e:
+            return f"❌ {str(e)}"
         config = load_project_config(project_path)
         now = datetime.now().isoformat()
 
@@ -585,7 +629,11 @@ async def get_server_limits() -> str:
 async def analyze_project_structure(input: AnalyzeProjectInput) -> str:
     """Analyze project and suggest optimal ignore patterns."""
     try:
-        project_path = Path(input.project_path).resolve()
+        # Validate and resolve project path
+        try:
+            project_path = validate_and_resolve_project_path(input.project_path)
+        except PathValidationError as e:
+            return f"❌ {str(e)}"
         info = analyze_project(project_path)
         sugg = suggest_patterns_for_project(project_path)
 
@@ -628,7 +676,11 @@ async def chunk_path_for_llm(input: ChunkPathInput) -> str:
     exactly like in prepare_context (same headers, numbered lines, etc.).
     """
     try:
-        project_path = Path(input.project_path).resolve()
+        # Validate and resolve project path
+        try:
+            project_path = validate_and_resolve_project_path(input.project_path)
+        except PathValidationError as e:
+            return f"❌ {str(e)}"
         config = load_project_config(project_path)
 
         # Resolve the target root (dir or glob), relative to project
@@ -745,7 +797,11 @@ async def save_tokens(input: SaveTokensInput) -> str:
     Only touches files modified before the given cutoff date.
     """
     try:
-        project_path = Path(input.project_path).resolve()
+        # Validate and resolve project path
+        try:
+            project_path = validate_and_resolve_project_path(input.project_path)
+        except PathValidationError as e:
+            return f"❌ {str(e)}"
         reports_dir = project_path / "context_reports"
         if not reports_dir.exists():
             return "⚠️ No context_reports/ directory found."

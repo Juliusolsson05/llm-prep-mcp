@@ -127,6 +127,168 @@ class ServerConfig:
 server_config = ServerConfig()
 
 
+# -------- Path validation utilities --------
+
+class PathValidationError(Exception):
+    """Raised when a project path cannot be accessed or validated."""
+    pass
+
+
+def validate_and_resolve_project_path(project_path_str: str) -> Path:
+    """
+    Validate and resolve a project path, handling Docker mode and permissions.
+
+    In Docker mode:
+    - Paths must be within /workspace (the mounted volume)
+    - Absolute paths outside workspace are rejected with helpful guidance
+
+    In non-Docker mode:
+    - Validates the path exists and is readable
+    - Provides clear error messages for permission issues
+
+    Args:
+        project_path_str: The project path as a string
+
+    Returns:
+        Resolved Path object that is guaranteed to be accessible
+
+    Raises:
+        PathValidationError: If the path is invalid, inaccessible, or outside allowed boundaries
+    """
+    if server_config.docker_mode:
+        return _validate_docker_path(project_path_str)
+    else:
+        return _validate_local_path(project_path_str)
+
+
+def _validate_docker_path(project_path_str: str) -> Path:
+    """Validate path in Docker mode - must be within workspace."""
+    workspace = Path(server_config.workspace_dir)
+    raw = Path(project_path_str)
+
+    # Handle various input formats
+    if project_path_str.startswith(str(workspace)):
+        # Already a workspace path
+        resolved = raw.resolve()
+    elif raw.is_absolute():
+        # User passed their local absolute path (e.g., /Users/foo/project)
+        # This won't work in Docker - guide them to use workspace
+        raise PathValidationError(
+            f"Cannot access absolute path '{project_path_str}' in Docker mode.\n"
+            f"In Docker, only the mounted workspace is accessible.\n"
+            f"\n"
+            f"Solutions:\n"
+            f"1. Use the workspace path: {workspace}\n"
+            f"2. Use a relative path (e.g., '.' for current directory)\n"
+            f"3. Ensure your project is mounted: -v /your/project:/workspace\n"
+            f"\n"
+            f"Current workspace: {workspace}"
+        )
+    else:
+        # Relative path - resolve relative to workspace
+        resolved = (workspace / raw).resolve()
+
+    # Verify it's under workspace (prevent path traversal)
+    try:
+        resolved.relative_to(workspace)
+    except ValueError:
+        raise PathValidationError(
+            f"Path '{resolved}' is outside the Docker workspace.\n"
+            f"All paths must be within {workspace}.\n"
+            f"Check your mount: -v /your/project:/workspace"
+        )
+
+    # Check accessibility
+    if not resolved.exists():
+        raise PathValidationError(
+            f"Path '{resolved}' does not exist in the Docker workspace.\n"
+            f"Ensure your project is properly mounted at {workspace}."
+        )
+
+    try:
+        if resolved.is_dir():
+            # Try to list directory to verify read access
+            next(resolved.iterdir(), None)
+        else:
+            resolved.stat()
+    except PermissionError:
+        raise PathValidationError(
+            f"Permission denied accessing '{resolved}'.\n"
+            f"Check file permissions in your mounted volume."
+        )
+    except Exception as e:
+        raise PathValidationError(f"Error accessing '{resolved}': {e}")
+
+    return resolved
+
+
+def _validate_local_path(project_path_str: str) -> Path:
+    """Validate path in local (non-Docker) mode."""
+    try:
+        resolved = Path(project_path_str).resolve()
+    except Exception as e:
+        raise PathValidationError(f"Invalid path '{project_path_str}': {e}")
+
+    # Check existence
+    if not resolved.exists():
+        raise PathValidationError(
+            f"Path does not exist: {resolved}\n"
+            f"Please provide a valid project directory."
+        )
+
+    # Check read permissions
+    try:
+        if resolved.is_dir():
+            # Try to list directory contents
+            next(resolved.iterdir(), None)
+        else:
+            resolved.stat()
+    except PermissionError:
+        raise PathValidationError(
+            f"Permission denied: '{resolved}'\n"
+            f"\n"
+            f"You don't have read access to this directory.\n"
+            f"Try one of these:\n"
+            f"1. Use a directory you own (e.g., your home directory)\n"
+            f"2. Check file/folder permissions\n"
+            f"3. If using Docker, ensure proper volume mounts"
+        )
+    except Exception as e:
+        raise PathValidationError(f"Error accessing '{resolved}': {e}")
+
+    return resolved
+
+
+def safe_iterdir(path: Path) -> List[Path]:
+    """Safely iterate a directory, returning empty list on permission error."""
+    try:
+        return list(path.iterdir())
+    except PermissionError:
+        return []
+    except Exception:
+        return []
+
+
+def safe_glob(path: Path, pattern: str) -> List[Path]:
+    """Safely glob a directory, returning empty list on permission error."""
+    try:
+        return list(path.glob(pattern))
+    except PermissionError:
+        return []
+    except Exception:
+        return []
+
+
+def safe_rglob(path: Path, pattern: str) -> List[Path]:
+    """Safely recursive glob a directory, returning empty list on permission error."""
+    try:
+        return list(path.rglob(pattern))
+    except PermissionError:
+        return []
+    except Exception:
+        return []
+
+
 # -------- Ignore pattern utilities --------
 
 CRITICAL_FILES = {
@@ -227,7 +389,10 @@ def get_default_ignore_patterns() -> List[str]:
 
 
 def detect_project_type(project_path: Path) -> str:
-    """Detect the type of project based on files present"""
+    """Detect the type of project based on files present.
+
+    Handles permission errors gracefully - returns 'general' if unable to detect.
+    """
     indicators = {
         'python': ['requirements.txt', 'setup.py', 'pyproject.toml', 'Pipfile'],
         'javascript': ['package.json', 'yarn.lock', 'package-lock.json'],
@@ -238,17 +403,23 @@ def detect_project_type(project_path: Path) -> str:
         'ruby': ['Gemfile'],
         'php': ['composer.json']
     }
-    
-    for lang, files in indicators.items():
-        for file_pattern in files:
-            if '*' in file_pattern:
-                # Handle wildcards
-                if list(project_path.glob(file_pattern)):
-                    return lang
-            else:
-                if (project_path / file_pattern).exists():
-                    return lang
-    
+
+    try:
+        for lang, files in indicators.items():
+            for file_pattern in files:
+                if '*' in file_pattern:
+                    # Handle wildcards - use safe_glob
+                    if safe_glob(project_path, file_pattern):
+                        return lang
+                else:
+                    try:
+                        if (project_path / file_pattern).exists():
+                            return lang
+                    except PermissionError:
+                        continue
+    except Exception:
+        pass
+
     return 'general'
 
 
@@ -276,18 +447,28 @@ def suggest_ignore_patterns(project_path: Path) -> str:
 
 
 def get_dir_size(path: Path, max_depth: int = 2) -> int:
-    """Rough directory size (bytes), shallow to avoid long scans."""
+    """Rough directory size (bytes), shallow to avoid long scans.
+
+    Handles permission errors gracefully - returns 0 for inaccessible paths.
+    """
     total = 0
     try:
-        for root, dirs, files in os.walk(path):
+        for root, dirs, files in os.walk(path, onerror=lambda e: None):
             # limit depth
-            if Path(root).relative_to(path).parts and len(Path(root).relative_to(path).parts) >= max_depth:
-                dirs[:] = []  # don't descend further
+            try:
+                rel_parts = Path(root).relative_to(path).parts
+                if rel_parts and len(rel_parts) >= max_depth:
+                    dirs[:] = []  # don't descend further
+            except ValueError:
+                dirs[:] = []
+                continue
             for f in files:
                 try:
                     total += (Path(root) / f).stat().st_size
-                except Exception:
+                except (PermissionError, OSError):
                     pass
+    except PermissionError:
+        pass
     except Exception:
         pass
     return total
@@ -299,27 +480,44 @@ def analyze_project(project_path: Path) -> Dict[str, Any]:
       - big directories
       - compiled/binary footprints
       - detected project_type
+
+    Handles permission errors gracefully - returns safe defaults for inaccessible paths.
     """
     project_type = detect_project_type(project_path)
+
+    # Check indicators with permission handling
+    def safe_exists(p: Path) -> bool:
+        try:
+            return p.exists()
+        except PermissionError:
+            return False
+
     indicators = {
-        "node": (project_path / "package.json").exists(),
-        "python": any((project_path / n).exists() for n in ["requirements.txt","pyproject.toml","Pipfile"]),
-        "go": (project_path / "go.mod").exists(),
-        "rust": (project_path / "Cargo.toml").exists()
+        "node": safe_exists(project_path / "package.json"),
+        "python": any(safe_exists(project_path / n) for n in ["requirements.txt", "pyproject.toml", "Pipfile"]),
+        "go": safe_exists(project_path / "go.mod"),
+        "rust": safe_exists(project_path / "Cargo.toml")
     }
-    build_tools = [p.name for p in project_path.glob("**/webpack.config.*")]  # quick hint
 
+    # Use safe_glob for build tools
+    build_tools = [p.name for p in safe_glob(project_path, "**/webpack.config.*")]
+
+    # Use safe_iterdir for big dirs
     big_dirs = []
-    for item in project_path.iterdir():
-        if item.is_dir() and item.name not in {".git", ".venv", "venv"}:
-            sz = get_dir_size(item)
-            if sz >= 100_000_000:  # 100MB
-                big_dirs.append({"name": item.name, "bytes": sz})
+    for item in safe_iterdir(project_path):
+        try:
+            if item.is_dir() and item.name not in {".git", ".venv", "venv"}:
+                sz = get_dir_size(item)
+                if sz >= 100_000_000:  # 100MB
+                    big_dirs.append({"name": item.name, "bytes": sz})
+        except PermissionError:
+            continue
 
+    # Use safe_rglob for compiled files
     compiled_globs = ["*.pyc", "*.class", "*.o", "*.so", "*.dll", "*.dylib", "*.test"]
     compiled_present = []
     for pat in compiled_globs:
-        if list(project_path.rglob(pat)):
+        if safe_rglob(project_path, pat):
             compiled_present.append(pat)
 
     return {
