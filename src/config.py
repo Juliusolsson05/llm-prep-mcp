@@ -171,19 +171,9 @@ def _validate_docker_path(project_path_str: str) -> Path:
         # Already a workspace path
         resolved = raw.resolve()
     elif raw.is_absolute():
-        # User passed their local absolute path (e.g., /Users/foo/project)
-        # This won't work in Docker - guide them to use workspace
-        raise PathValidationError(
-            f"Cannot access absolute path '{project_path_str}' in Docker mode.\n"
-            f"In Docker, only the mounted workspace is accessible.\n"
-            f"\n"
-            f"Solutions:\n"
-            f"1. Use the workspace path: {workspace}\n"
-            f"2. Use a relative path (e.g., '.' for current directory)\n"
-            f"3. Ensure your project is mounted: -v /your/project:/workspace\n"
-            f"\n"
-            f"Current workspace: {workspace}"
-        )
+        # Host path like /Users/foo/project -> use /workspace instead
+        # This happens when Claude Code passes the host path but Docker only sees /workspace
+        resolved = workspace.resolve()
     else:
         # Relative path - resolve relative to workspace
         resolved = (workspace / raw).resolve()
